@@ -1,0 +1,550 @@
+// File: execution/hyperliquid_client.go
+// Hyperliquid API client and WebSocket management
+
+package execution
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/gorilla/websocket"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+)
+
+const (
+	HyperliquidAPIURL  = "https://api.hyperliquid.xyz"
+	HyperliquidWSURL   = "wss://api.hyperliquid.xyz/ws"
+	HyperliquidTestAPI = "https://api.hyperliquid-testnet.xyz"
+	HyperliquidTestWS  = "wss://api.hyperliquid-testnet.xyz/ws"
+
+	APITimeout           = time.Second * 30
+	WSPingInterval       = time.Second * 30
+	WSPongTimeout        = time.Second * 10
+	ReconnectDelay       = time.Second * 5
+	MaxReconnectAttempts = 10
+)
+
+// HyperliquidClient handles all API communication
+type HyperliquidClient struct {
+	httpClient *http.Client
+	wsConn     *websocket.Conn
+	privateKey *ecdsa.PrivateKey
+	apiURL     string
+	wsURL      string
+	logger     *zap.Logger
+
+	// WebSocket management
+	wsConnected    bool
+	reconnectCount int
+	wsMessages     chan []byte
+	wsErrors       chan error
+}
+
+// API Request/Response types
+type APIRequest struct {
+	Action string      `json:"action"`
+	Type   string      `json:"type"`
+	Data   interface{} `json:"data"`
+}
+
+type APIResponse struct {
+	Status   string      `json:"status"`
+	Response interface{} `json:"response"`
+	Error    string      `json:"error,omitempty"`
+}
+
+type OrderRequest struct {
+	Asset     string                 `json:"asset"`
+	IsBuy     bool                   `json:"is_buy"`
+	Size      string                 `json:"sz"`
+	OrderType map[string]interface{} `json:"order_type"`
+	TIF       string                 `json:"tif"`
+	ClOID     string                 `json:"cloid"`
+	LimitPx   string                 `json:"limit_px,omitempty"`
+}
+
+type CancelRequest struct {
+	OID string `json:"oid"`
+}
+
+type WSSubscription struct {
+	Method       string      `json:"method"`
+	Subscription interface{} `json:"subscription"`
+}
+
+type WSMessage struct {
+	Channel string      `json:"channel"`
+	Data    interface{} `json:"data"`
+}
+
+// NewHyperliquidClient creates a new API client
+func NewHyperliquidClient(privateKey *ecdsa.PrivateKey, testMode bool, logger *zap.Logger) *HyperliquidClient {
+	apiURL := HyperliquidAPIURL
+	wsURL := HyperliquidWSURL
+
+	if testMode {
+		apiURL = HyperliquidTestAPI
+		wsURL = HyperliquidTestWS
+	}
+
+	return &HyperliquidClient{
+		httpClient: &http.Client{
+			Timeout: APITimeout,
+		},
+		privateKey: privateKey,
+		apiURL:     apiURL,
+		wsURL:      wsURL,
+		logger:     logger,
+		wsMessages: make(chan []byte, 100),
+		wsErrors:   make(chan error, 10),
+	}
+}
+
+// HTTP API Methods
+
+// PlaceOrder sends an order to Hyperliquid
+func (c *HyperliquidClient) PlaceOrder(order *Order) error {
+	orderType := c.buildOrderType(order)
+
+	orderReq := OrderRequest{
+		Asset:     order.Symbol,
+		IsBuy:     order.Side == PositionLong,
+		Size:      fmt.Sprintf("%.2f", order.Size),
+		OrderType: orderType,
+		TIF:       order.TimeInForce,
+		ClOID:     order.ClientOrderID,
+	}
+
+	if order.Type == OrderTypeLimit {
+		orderReq.LimitPx = fmt.Sprintf("%.2f", order.Price)
+	}
+
+	request := APIRequest{
+		Action: "order",
+		Type:   "order",
+		Data:   orderReq,
+	}
+
+	response, err := c.sendSignedRequest(request)
+	if err != nil {
+		return fmt.Errorf("failed to place order: %w", err)
+	}
+
+	// Parse response and update order
+	if response.Status != "ok" {
+		return fmt.Errorf("order rejected: %s", response.Error)
+	}
+
+	// Extract order ID from response
+	if respData, ok := response.Response.(map[string]interface{}); ok {
+		if statuses, ok := respData["data"].(map[string]interface{}); ok {
+			if status, ok := statuses["statuses"].([]interface{}); ok && len(status) > 0 {
+				if orderStatus, ok := status[0].(map[string]interface{}); ok {
+					if oid, ok := orderStatus["oid"].(float64); ok {
+						order.ID = fmt.Sprintf("%.0f", oid)
+						order.Status = OrderStatusPending
+						order.UpdatedAt = time.Now()
+					}
+				}
+			}
+		}
+	}
+
+	c.logger.Info("Order placed successfully",
+		zap.String("order_id", order.ID),
+		zap.String("symbol", order.Symbol),
+		zap.String("side", string(order.Side)),
+		zap.String("type", string(order.Type)))
+
+	return nil
+}
+
+// CancelOrder cancels an existing order
+func (c *HyperliquidClient) CancelOrder(orderID string) error {
+	request := APIRequest{
+		Action: "cancel",
+		Type:   "order",
+		Data: CancelRequest{
+			OID: orderID,
+		},
+	}
+
+	response, err := c.sendSignedRequest(request)
+	if err != nil {
+		return fmt.Errorf("failed to cancel order: %w", err)
+	}
+
+	if response.Status != "ok" {
+		return fmt.Errorf("cancel rejected: %s", response.Error)
+	}
+
+	c.logger.Info("Order cancelled successfully", zap.String("order_id", orderID))
+	return nil
+}
+
+// GetUserState fetches current user state (positions, orders, balance)
+func (c *HyperliquidClient) GetUserState(userAddress string) (map[string]interface{}, error) {
+	request := map[string]interface{}{
+		"type": "clearinghouseState",
+		"user": userAddress,
+	}
+
+	response, err := c.sendPublicRequest(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user state: %w", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(response, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse user state: %w", err)
+	}
+
+	return result, nil
+}
+
+// GetMarketData fetches current market data
+func (c *HyperliquidClient) GetMarketData() (map[string]interface{}, error) {
+	request := map[string]interface{}{
+		"type": "meta",
+	}
+
+	response, err := c.sendPublicRequest(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get market data: %w", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(response, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse market data: %w", err)
+	}
+
+	return result, nil
+}
+
+// GetOrderbook fetches orderbook for a symbol
+func (c *HyperliquidClient) GetOrderbook(symbol string) (map[string]interface{}, error) {
+	request := map[string]interface{}{
+		"type": "l2Book",
+		"coin": symbol,
+	}
+
+	response, err := c.sendPublicRequest(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get orderbook: %w", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(response, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse orderbook: %w", err)
+	}
+
+	return result, nil
+}
+
+// WebSocket Methods
+
+// ConnectWebSocket establishes WebSocket connection
+func (c *HyperliquidClient) ConnectWebSocket() error {
+	if c.wsConnected {
+		return nil
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(c.wsURL, nil)
+	if err != nil {
+		return fmt.Errorf("websocket connection failed: %w", err)
+	}
+
+	c.wsConn = conn
+	c.wsConnected = true
+	c.reconnectCount = 0
+
+	// Set up ping/pong for connection health
+	c.wsConn.SetPongHandler(func(string) error {
+		c.wsConn.SetReadDeadline(time.Now().Add(WSPongTimeout))
+		return nil
+	})
+
+	c.logger.Info("WebSocket connected successfully")
+	return nil
+}
+
+// DisconnectWebSocket closes WebSocket connection
+func (c *HyperliquidClient) DisconnectWebSocket() error {
+	if !c.wsConnected || c.wsConn == nil {
+		return nil
+	}
+
+	c.wsConnected = false
+	err := c.wsConn.Close()
+	c.wsConn = nil
+
+	c.logger.Info("WebSocket disconnected")
+	return err
+}
+
+// SubscribeToFeeds subscribes to WebSocket data feeds
+func (c *HyperliquidClient) SubscribeToFeeds(userAddress string) error {
+	if !c.wsConnected {
+		return fmt.Errorf("websocket not connected")
+	}
+
+	subscriptions := []WSSubscription{
+		{
+			Method: "subscribe",
+			Subscription: map[string]interface{}{
+				"type": "user",
+				"user": userAddress,
+			},
+		},
+		{
+			Method: "subscribe",
+			Subscription: map[string]interface{}{
+				"type": "trades",
+				"user": userAddress,
+			},
+		},
+		{
+			Method: "subscribe",
+			Subscription: map[string]interface{}{
+				"type": "fills",
+				"user": userAddress,
+			},
+		},
+	}
+
+	for _, sub := range subscriptions {
+		if err := c.wsConn.WriteJSON(sub); err != nil {
+			return fmt.Errorf("failed to subscribe to %v: %w", sub.Subscription, err)
+		}
+		c.logger.Debug("Subscribed to WebSocket feed", zap.Any("subscription", sub.Subscription))
+	}
+
+	return nil
+}
+
+// ReadWebSocketMessages reads messages from WebSocket
+func (c *HyperliquidClient) ReadWebSocketMessages() (<-chan []byte, <-chan error) {
+	go c.wsMessageReader()
+	return c.wsMessages, c.wsErrors
+}
+
+// StartWebSocketPing starts ping mechanism for connection health
+func (c *HyperliquidClient) StartWebSocketPing() {
+	if !c.wsConnected {
+		return
+	}
+
+	ticker := time.NewTicker(WSPingInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !c.wsConnected {
+					return
+				}
+
+				if err := c.wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					c.wsErrors <- fmt.Errorf("ping failed: %w", err)
+					return
+				}
+			}
+		}
+	}()
+}
+
+// Private Methods
+
+func (c *HyperliquidClient) buildOrderType(order *Order) map[string]interface{} {
+	switch order.Type {
+	case OrderTypeMarket:
+		return map[string]interface{}{
+			"trigger": map[string]interface{}{
+				"isMarket": true,
+				"tpsl":     "tp",
+			},
+		}
+	case OrderTypeLimit:
+		return map[string]interface{}{
+			"limit": map[string]interface{}{
+				"tif": order.TimeInForce,
+			},
+		}
+	case OrderTypeStop:
+		return map[string]interface{}{
+			"trigger": map[string]interface{}{
+				"triggerPx": fmt.Sprintf("%.2f", order.Price),
+				"isMarket":  false,
+				"tpsl":      "tp",
+			},
+		}
+	default:
+		return map[string]interface{}{
+			"limit": map[string]interface{}{
+				"tif": "Gtc",
+			},
+		}
+	}
+}
+
+func (c *HyperliquidClient) sendSignedRequest(request APIRequest) (*APIResponse, error) {
+	// Serialize request
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Create signature
+	hash := sha256.Sum256(jsonData)
+	signature, err := crypto.Sign(hash[:], c.privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign request: %w", err)
+	}
+
+	// Create HTTP request
+	httpReq, err := http.NewRequest("POST", c.apiURL+"/exchange", bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	// Set headers
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Signature", hex.EncodeToString(signature))
+
+	// Send request
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response
+	var apiResp APIResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &apiResp, nil
+}
+
+func (c *HyperliquidClient) sendPublicRequest(request map[string]interface{}) ([]byte, error) {
+	// Serialize request
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Create HTTP request
+	httpReq, err := http.NewRequest("POST", c.apiURL+"/info", bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	// Send request
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	return body, nil
+}
+
+func (c *HyperliquidClient) wsMessageReader() {
+	defer close(c.wsMessages)
+	defer close(c.wsErrors)
+
+	for c.wsConnected {
+		_, message, err := c.wsConn.ReadMessage()
+		if err != nil {
+			if !c.wsConnected {
+				return // Normal shutdown
+			}
+
+			c.wsErrors <- fmt.Errorf("websocket read error: %w", err)
+
+			// Attempt reconnection
+			if c.reconnectCount < MaxReconnectAttempts {
+				c.logger.Warn("WebSocket disconnected, attempting reconnection",
+					zap.Int("attempt", c.reconnectCount+1))
+
+				c.wsConnected = false
+				time.Sleep(ReconnectDelay)
+
+				if err := c.ConnectWebSocket(); err != nil {
+					c.reconnectCount++
+					c.wsErrors <- fmt.Errorf("reconnection failed: %w", err)
+					continue
+				}
+			} else {
+				c.wsErrors <- fmt.Errorf("max reconnection attempts reached")
+				return
+			}
+		}
+
+		c.wsMessages <- message
+	}
+}
+
+// GetCurrentPrice fetches current market price for a symbol
+func (c *HyperliquidClient) GetCurrentPrice(symbol string) (decimal.Decimal, error) {
+	orderbook, err := c.GetOrderbook(symbol)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("failed to get orderbook: %w", err)
+	}
+
+	// Extract best bid/ask
+	if levels, ok := orderbook["levels"].([]interface{}); ok && len(levels) >= 2 {
+		bids, ok1 := levels[0].([]interface{})
+		asks, ok2 := levels[1].([]interface{})
+
+		if ok1 && ok2 && len(bids) > 0 && len(asks) > 0 {
+			bidPrice, err1 := decimal.NewFromString(bids[0].([]interface{})[0].(string))
+			askPrice, err2 := decimal.NewFromString(asks[0].([]interface{})[0].(string))
+
+			if err1 == nil && err2 == nil {
+				// Return mid price
+				return bidPrice.Add(askPrice).Div(decimal.NewFromInt(2)), nil
+			}
+		}
+	}
+
+	return decimal.Zero, fmt.Errorf("failed to parse orderbook prices")
+}
+
+// HealthCheck performs a simple API health check
+func (c *HyperliquidClient) HealthCheck() error {
+	_, err := c.GetMarketData()
+	return err
+}

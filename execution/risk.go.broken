@@ -1,0 +1,471 @@
+package execution
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+)
+
+// RiskViolation represents a risk limit violation
+type RiskViolation struct {
+	LimitID   string    `json:"limit_id"`
+	Type      string    `json:"type"`
+	Severity  string    `json:"severity"`
+	Message   string    `json:"message"`
+	Value     string    `json:"value"`
+	Limit     string    `json:"limit"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// RiskManager manages risk limits and validation
+type RiskManager struct {
+	limits        map[string]*RiskLimit
+	orderCounts   map[string]int // For rate limiting
+	lastOrderTime map[string]time.Time
+	logger        *zap.Logger
+	mutex         sync.RWMutex
+}
+
+// NewRiskManager creates a new risk manager
+func NewRiskManager(limits []*RiskLimit, logger *zap.Logger) (*RiskManager, error) {
+	if logger == nil {
+		return nil, fmt.Errorf("logger cannot be nil")
+	}
+
+	rm := &RiskManager{
+		limits:        make(map[string]*RiskLimit),
+		orderCounts:   make(map[string]int),
+		lastOrderTime: make(map[string]time.Time),
+		logger:        logger,
+	}
+
+	// Add all provided limits
+	for _, limit := range limits {
+		if limit.Enabled {
+			rm.limits[limit.ID] = limit
+		}
+	}
+
+	rm.logger.Info("Risk manager initialized", zap.Int("active_limits", len(rm.limits)))
+
+	return rm, nil
+}
+
+// ValidateRequest validates an execution request against all risk limits
+func (rm *RiskManager) ValidateRequest(request *ExecutionRequest, portfolio *Portfolio) error {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+
+	// Check each active risk limit
+	for _, limit := range rm.limits {
+		if err := rm.validateAgainstLimit(request, portfolio, limit); err != nil {
+			return fmt.Errorf("risk limit %s violated: %w", limit.ID, err)
+		}
+	}
+
+	// Update order rate tracking
+	rm.updateOrderRateTracking(request)
+
+	return nil
+}
+
+// validateAgainstLimit validates a request against a specific risk limit
+func (rm *RiskManager) validateAgainstLimit(request *ExecutionRequest, portfolio *Portfolio, limit *RiskLimit) error {
+	// Check symbol restrictions
+	if len(limit.AllowedSymbols) > 0 {
+		allowed := false
+		for _, allowedSymbol := range limit.AllowedSymbols {
+			if request.Symbol == allowedSymbol {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("symbol %s not in allowed list", request.Symbol)
+		}
+	}
+
+	// Check blocked symbols
+	for _, blockedSymbol := range limit.BlockedSymbols {
+		if request.Symbol == blockedSymbol {
+			return fmt.Errorf("symbol %s is blocked", request.Symbol)
+		}
+	}
+
+	// Check maximum order size
+	if limit.MaxOrderSize.GreaterThan(decimal.Zero) && request.Quantity.GreaterThan(limit.MaxOrderSize) {
+		return fmt.Errorf("order quantity %s exceeds maximum %s",
+			request.Quantity.String(), limit.MaxOrderSize.String())
+	}
+
+	// Check order rate limits
+	if limit.MaxOrdersPerSecond > 0 {
+		key := fmt.Sprintf("%s_%s", request.BrokerType, request.Symbol)
+		if count, exists := rm.orderCounts[key]; exists {
+			if count >= limit.MaxOrdersPerSecond {
+				if lastTime, timeExists := rm.lastOrderTime[key]; timeExists {
+					if time.Since(lastTime) < time.Second {
+						return fmt.Errorf("order rate limit exceeded: %d orders per second",
+							limit.MaxOrdersPerSecond)
+					}
+				}
+			}
+		}
+	}
+
+	// Portfolio-level checks (require portfolio state)
+	if portfolio != nil {
+		portfolio.mutex.RLock()
+		defer portfolio.mutex.RUnlock()
+
+		// Check maximum daily loss
+		if limit.MaxDailyLoss.GreaterThan(decimal.Zero) {
+			if portfolio.DayPnL.LessThan(limit.MaxDailyLoss.Neg()) {
+				return fmt.Errorf("daily loss %s exceeds maximum %s",
+					portfolio.DayPnL.String(), limit.MaxDailyLoss.String())
+			}
+		}
+
+		// Check maximum drawdown
+		if limit.MaxDrawdown.GreaterThan(decimal.Zero) {
+			if portfolio.MaxDrawdown.GreaterThan(limit.MaxDrawdown) {
+				return fmt.Errorf("portfolio drawdown %s exceeds maximum %s",
+					portfolio.MaxDrawdown.String(), limit.MaxDrawdown.String())
+			}
+		}
+
+		// Check maximum total exposure
+		if limit.MaxTotalExposure.GreaterThan(decimal.Zero) {
+			currentExposure := rm.calculateTotalExposure(portfolio)
+			orderValue := request.Quantity.Mul(request.Price)
+
+			if currentExposure.Add(orderValue).GreaterThan(limit.MaxTotalExposure) {
+				return fmt.Errorf("total exposure would exceed maximum %s",
+					limit.MaxTotalExposure.String())
+			}
+		}
+
+		// Check maximum position size for this symbol
+		if limit.MaxPositionSize.GreaterThan(decimal.Zero) {
+			currentPosition := decimal.Zero
+			if position, exists := portfolio.Positions[request.Symbol]; exists {
+				currentPosition = position.Quantity.Abs()
+			}
+
+			newQuantity := request.Quantity
+			if request.Side == ExecutionSideSell {
+				newQuantity = newQuantity.Neg()
+			}
+
+			if position, exists := portfolio.Positions[request.Symbol]; exists {
+				// Calculate new position size
+				if (position.Quantity.GreaterThan(decimal.Zero) && newQuantity.GreaterThan(decimal.Zero)) ||
+					(position.Quantity.LessThan(decimal.Zero) && newQuantity.LessThan(decimal.Zero)) {
+					// Adding to position
+					newPositionSize := position.Quantity.Add(newQuantity).Abs()
+					if newPositionSize.GreaterThan(limit.MaxPositionSize) {
+						return fmt.Errorf("position size would exceed maximum %s for %s",
+							limit.MaxPositionSize.String(), request.Symbol)
+					}
+				}
+			} else {
+				// New position
+				if request.Quantity.GreaterThan(limit.MaxPositionSize) {
+					return fmt.Errorf("new position size %s exceeds maximum %s for %s",
+						request.Quantity.String(), limit.MaxPositionSize.String(), request.Symbol)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// CheckLimits checks current portfolio against all risk limits
+func (rm *RiskManager) CheckLimits(portfolio *Portfolio) []*RiskViolation {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+
+	var violations []*RiskViolation
+
+	portfolio.mutex.RLock()
+	defer portfolio.mutex.RUnlock()
+
+	for _, limit := range rm.limits {
+		if violationList := rm.checkPortfolioAgainstLimit(portfolio, limit); len(violationList) > 0 {
+			violations = append(violations, violationList...)
+		}
+	}
+
+	return violations
+}
+
+// checkPortfolioAgainstLimit checks portfolio against a specific limit
+func (rm *RiskManager) checkPortfolioAgainstLimit(portfolio *Portfolio, limit *RiskLimit) []*RiskViolation {
+	var violations []*RiskViolation
+
+	// Check daily loss limit
+	if limit.MaxDailyLoss.GreaterThan(decimal.Zero) {
+		if portfolio.DayPnL.LessThan(limit.MaxDailyLoss.Neg()) {
+			violations = append(violations, &RiskViolation{
+				LimitID:   limit.ID,
+				Type:      "DAILY_LOSS",
+				Severity:  "CRITICAL",
+				Message:   "Daily loss limit exceeded",
+				Value:     portfolio.DayPnL.String(),
+				Limit:     limit.MaxDailyLoss.Neg().String(),
+				Timestamp: time.Now(),
+			})
+		}
+	}
+
+	// Check drawdown limit
+	if limit.MaxDrawdown.GreaterThan(decimal.Zero) {
+		if portfolio.MaxDrawdown.GreaterThan(limit.MaxDrawdown) {
+			violations = append(violations, &RiskViolation{
+				LimitID:   limit.ID,
+				Type:      "MAX_DRAWDOWN",
+				Severity:  "CRITICAL",
+				Message:   "Maximum drawdown exceeded",
+				Value:     portfolio.MaxDrawdown.String(),
+				Limit:     limit.MaxDrawdown.String(),
+				Timestamp: time.Now(),
+			})
+		}
+	}
+
+	// Check total exposure
+	if limit.MaxTotalExposure.GreaterThan(decimal.Zero) {
+		totalExposure := rm.calculateTotalExposure(portfolio)
+		if totalExposure.GreaterThan(limit.MaxTotalExposure) {
+			violations = append(violations, &RiskViolation{
+				LimitID:   limit.ID,
+				Type:      "TOTAL_EXPOSURE",
+				Severity:  "WARNING",
+				Message:   "Total exposure limit exceeded",
+				Value:     totalExposure.String(),
+				Limit:     limit.MaxTotalExposure.String(),
+				Timestamp: time.Now(),
+			})
+		}
+	}
+
+	// Check individual position sizes
+	if limit.MaxPositionSize.GreaterThan(decimal.Zero) {
+		for symbol, position := range portfolio.Positions {
+			if position.Quantity.Abs().GreaterThan(limit.MaxPositionSize) {
+				violations = append(violations, &RiskViolation{
+					LimitID:   limit.ID,
+					Type:      "POSITION_SIZE",
+					Severity:  "WARNING",
+					Message:   fmt.Sprintf("Position size limit exceeded for %s", symbol),
+					Value:     position.Quantity.Abs().String(),
+					Limit:     limit.MaxPositionSize.String(),
+					Timestamp: time.Now(),
+				})
+			}
+		}
+	}
+
+	return violations
+}
+
+// calculateTotalExposure calculates the total portfolio exposure
+func (rm *RiskManager) calculateTotalExposure(portfolio *Portfolio) decimal.Decimal {
+	totalExposure := decimal.Zero
+
+	for _, position := range portfolio.Positions {
+		if !position.Quantity.IsZero() {
+			positionValue := position.MarketPrice.Mul(position.Quantity.Abs())
+			totalExposure = totalExposure.Add(positionValue)
+		}
+	}
+
+	return totalExposure
+}
+
+// updateOrderRateTracking updates order rate tracking
+func (rm *RiskManager) updateOrderRateTracking(request *ExecutionRequest) {
+	key := fmt.Sprintf("%s_%s", request.BrokerType, request.Symbol)
+	now := time.Now()
+
+	// Reset counter if more than a second has passed
+	if lastTime, exists := rm.lastOrderTime[key]; exists {
+		if now.Sub(lastTime) >= time.Second {
+			rm.orderCounts[key] = 0
+		}
+	}
+
+	rm.orderCounts[key]++
+	rm.lastOrderTime[key] = now
+}
+
+// AddRiskLimit adds a new risk limit
+func (rm *RiskManager) AddRiskLimit(limit *RiskLimit) error {
+	if limit == nil {
+		return fmt.Errorf("risk limit cannot be nil")
+	}
+
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+
+	if limit.Enabled {
+		rm.limits[limit.ID] = limit
+		rm.logger.Info("Risk limit added", zap.String("limit_id", limit.ID))
+	}
+
+	return nil
+}
+
+// RemoveRiskLimit removes a risk limit
+func (rm *RiskManager) RemoveRiskLimit(limitID string) error {
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+
+	if _, exists := rm.limits[limitID]; !exists {
+		return fmt.Errorf("risk limit %s not found", limitID)
+	}
+
+	delete(rm.limits, limitID)
+	rm.logger.Info("Risk limit removed", zap.String("limit_id", limitID))
+
+	return nil
+}
+
+// UpdateRiskLimit updates an existing risk limit
+func (rm *RiskManager) UpdateRiskLimit(limit *RiskLimit) error {
+	if limit == nil {
+		return fmt.Errorf("risk limit cannot be nil")
+	}
+
+	rm.mutex.Lock()
+	defer rm.mutex.Unlock()
+
+	if _, exists := rm.limits[limit.ID]; !exists {
+		return fmt.Errorf("risk limit %s not found", limit.ID)
+	}
+
+	if limit.Enabled {
+		rm.limits[limit.ID] = limit
+	} else {
+		delete(rm.limits, limit.ID)
+	}
+
+	rm.logger.Info("Risk limit updated", zap.String("limit_id", limit.ID))
+
+	return nil
+}
+
+// GetRiskLimits returns all active risk limits
+func (rm *RiskManager) GetRiskLimits() map[string]*RiskLimit {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+
+	// Return copies to prevent external modifications
+	limits := make(map[string]*RiskLimit)
+	for id, limit := range rm.limits {
+		limitCopy := *limit
+		limitCopy.AllowedSymbols = make([]string, len(limit.AllowedSymbols))
+		copy(limitCopy.AllowedSymbols, limit.AllowedSymbols)
+		limitCopy.BlockedSymbols = make([]string, len(limit.BlockedSymbols))
+		copy(limitCopy.BlockedSymbols, limit.BlockedSymbols)
+		limits[id] = &limitCopy
+	}
+
+	return limits
+}
+
+// GetRiskStatus returns current risk status
+func (rm *RiskManager) GetRiskStatus(portfolio *Portfolio) map[string]interface{} {
+	violations := rm.CheckLimits(portfolio)
+
+	status := map[string]interface{}{
+		"total_limits":     len(rm.limits),
+		"total_violations": len(violations),
+		"violations":       violations,
+		"last_check":       time.Now(),
+	}
+
+	// Categorize violations by severity
+	criticalCount := 0
+	warningCount := 0
+	for _, violation := range violations {
+		switch violation.Severity {
+		case "CRITICAL":
+			criticalCount++
+		case "WARNING":
+			warningCount++
+		}
+	}
+
+	status["critical_violations"] = criticalCount
+	status["warning_violations"] = warningCount
+
+	return status
+}
+
+// ValidatePositionSize validates a position size against limits
+func (rm *RiskManager) ValidatePositionSize(symbol string, newQuantity decimal.Decimal) error {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+
+	for _, limit := range rm.limits {
+		if limit.MaxPositionSize.GreaterThan(decimal.Zero) {
+			if newQuantity.Abs().GreaterThan(limit.MaxPositionSize) {
+				return fmt.Errorf("position size %s exceeds maximum %s for %s",
+					newQuantity.Abs().String(), limit.MaxPositionSize.String(), symbol)
+			}
+		}
+	}
+
+	return nil
+}
+
+// CalculateMaxAllowedQuantity calculates the maximum allowed quantity for a trade
+func (rm *RiskManager) CalculateMaxAllowedQuantity(request *ExecutionRequest, portfolio *Portfolio) decimal.Decimal {
+	rm.mutex.RLock()
+	defer rm.mutex.RUnlock()
+
+	maxQuantity := request.Quantity
+
+	for _, limit := range rm.limits {
+		// Check maximum order size
+		if limit.MaxOrderSize.GreaterThan(decimal.Zero) && maxQuantity.GreaterThan(limit.MaxOrderSize) {
+			maxQuantity = limit.MaxOrderSize
+		}
+
+		// Check maximum position size
+		if limit.MaxPositionSize.GreaterThan(decimal.Zero) && portfolio != nil {
+			portfolio.mutex.RLock()
+			currentPosition := decimal.Zero
+			if position, exists := portfolio.Positions[request.Symbol]; exists {
+				currentPosition = position.Quantity
+			}
+			portfolio.mutex.RUnlock()
+
+			// Calculate how much we can add to the position
+			if request.Side == ExecutionSideBuy {
+				availableQuantity := limit.MaxPositionSize.Sub(currentPosition)
+				if availableQuantity.LessThan(maxQuantity) && availableQuantity.GreaterThan(decimal.Zero) {
+					maxQuantity = availableQuantity
+				}
+			} else {
+				// For sell orders, consider short positions
+				availableQuantity := limit.MaxPositionSize.Add(currentPosition)
+				if availableQuantity.LessThan(maxQuantity) && availableQuantity.GreaterThan(decimal.Zero) {
+					maxQuantity = availableQuantity
+				}
+			}
+		}
+	}
+
+	// Ensure we don't return negative quantities
+	if maxQuantity.LessThan(decimal.Zero) {
+		return decimal.Zero
+	}
+
+	return maxQuantity
+}

@@ -1,0 +1,43 @@
+# Binaries
+hype-trading-bot
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Environment variables (NEVER commit private keys!)
+.env
+*.env
+.env.local
+.env.production
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.backup
+*.bak
+
+# Temporary files
+temp/
+tmp/

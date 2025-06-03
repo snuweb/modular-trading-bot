@@ -1,0 +1,758 @@
+// File: execution/order_manager.go
+// Order lifecycle management and monitoring
+
+package execution
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+)
+
+const (
+	OrderTimeout       = time.Second * 30
+	OrderCheckInterval = time.Second * 2
+	MaxOrderAge        = time.Minute * 5
+	MaxPendingOrders   = 100
+	FillCheckInterval  = time.Millisecond * 500
+)
+
+// OrderManager handles order lifecycle and monitoring
+type OrderManager struct {
+	client *HyperliquidClient
+	logger *zap.Logger
+
+	// Order storage
+	orders          map[string]*Order
+	ordersBySymbol  map[string][]*Order
+	pendingOrders   map[string]*Order
+	filledOrders    map[string]*Order
+	cancelledOrders map[string]*Order
+
+	// Synchronization
+	orderMu sync.RWMutex
+
+	// Monitoring
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	// Callbacks
+	onOrderFilled    func(*Order)
+	onOrderCancelled func(*Order)
+	onOrderRejected  func(*Order, error)
+	onOrderPartial   func(*Order)
+
+	// Metrics
+	totalOrders     int64
+	filledOrders24h int64
+	rejectedOrders  int64
+	lastOrderTime   time.Time
+}
+
+// OrderUpdateEvent represents an order update
+type OrderUpdateEvent struct {
+	OrderID    string          `json:"order_id"`
+	Status     OrderStatus     `json:"status"`
+	FilledSize decimal.Decimal `json:"filled_size"`
+	AvgPrice   decimal.Decimal `json:"avg_price"`
+	Timestamp  time.Time       `json:"timestamp"`
+	Error      string          `json:"error,omitempty"`
+}
+
+// FillEvent represents a trade fill
+type FillEvent struct {
+	OrderID   string          `json:"order_id"`
+	Symbol    string          `json:"symbol"`
+	Side      PositionSide    `json:"side"`
+	Size      decimal.Decimal `json:"size"`
+	Price     decimal.Decimal `json:"price"`
+	Fee       decimal.Decimal `json:"fee"`
+	Timestamp time.Time       `json:"timestamp"`
+	TradeID   string          `json:"trade_id"`
+}
+
+// OrderManagerConfig configuration for order manager
+type OrderManagerConfig struct {
+	MaxPendingOrders int           `json:"max_pending_orders"`
+	OrderTimeout     time.Duration `json:"order_timeout"`
+	CheckInterval    time.Duration `json:"check_interval"`
+	EnableMonitoring bool          `json:"enable_monitoring"`
+}
+
+// NewOrderManager creates a new order manager
+func NewOrderManager(client *HyperliquidClient, logger *zap.Logger) *OrderManager {
+	return &OrderManager{
+		client:          client,
+		logger:          logger,
+		orders:          make(map[string]*Order),
+		ordersBySymbol:  make(map[string][]*Order),
+		pendingOrders:   make(map[string]*Order),
+		filledOrders:    make(map[string]*Order),
+		cancelledOrders: make(map[string]*Order),
+	}
+}
+
+// Start begins order monitoring
+func (om *OrderManager) Start(ctx context.Context) error {
+	om.ctx, om.cancel = context.WithCancel(ctx)
+
+	// Start WebSocket message handling
+	messages, errors := om.client.ReadWebSocketMessages()
+
+	om.wg.Add(3)
+	go om.messageHandler(messages, errors)
+	go om.orderMonitor()
+	go om.staleOrderCleaner()
+
+	om.logger.Info("Order manager started")
+	return nil
+}
+
+// Stop stops order monitoring
+func (om *OrderManager) Stop() error {
+	if om.cancel != nil {
+		om.cancel()
+	}
+
+	om.wg.Wait()
+	om.logger.Info("Order manager stopped")
+	return nil
+}
+
+// SetCallbacks sets order event callbacks
+func (om *OrderManager) SetCallbacks(
+	onFilled func(*Order),
+	onCancelled func(*Order),
+	onRejected func(*Order, error),
+	onPartial func(*Order),
+) {
+	om.onOrderFilled = onFilled
+	om.onOrderCancelled = onCancelled
+	om.onOrderRejected = onRejected
+	om.onOrderPartial = onPartial
+}
+
+// SubmitOrder submits an order for execution
+func (om *OrderManager) SubmitOrder(order *Order) error {
+	// Validation
+	if err := om.validateOrder(order); err != nil {
+		return fmt.Errorf("order validation failed: %w", err)
+	}
+
+	// Check pending order limits
+	om.orderMu.RLock()
+	pendingCount := len(om.pendingOrders)
+	om.orderMu.RUnlock()
+
+	if pendingCount >= MaxPendingOrders {
+		return fmt.Errorf("too many pending orders: %d/%d", pendingCount, MaxPendingOrders)
+	}
+
+	// Generate order ID if not provided
+	if order.ClientOrderID == "" {
+		order.ClientOrderID = om.generateOrderID()
+	}
+
+	// Set initial status and timestamp
+	order.Status = OrderStatusPending
+	order.CreatedAt = time.Now()
+	order.UpdatedAt = time.Now()
+
+	// Store order
+	om.storeOrder(order)
+
+	// Submit to exchange
+	if err := om.client.PlaceOrder(order); err != nil {
+		om.removeOrder(order.ClientOrderID)
+
+		if om.onOrderRejected != nil {
+			om.onOrderRejected(order, err)
+		}
+
+		return fmt.Errorf("failed to submit order: %w", err)
+	}
+
+	om.totalOrders++
+	om.lastOrderTime = time.Now()
+
+	om.logger.Info("Order submitted successfully",
+		zap.String("order_id", order.ClientOrderID),
+		zap.String("symbol", order.Symbol),
+		zap.String("side", string(order.Side)),
+		zap.String("size", fmt.Sprintf("%.2f", order.Size)))
+
+	return nil
+}
+
+// CancelOrder cancels an order
+func (om *OrderManager) CancelOrder(orderID string) error {
+	om.orderMu.RLock()
+	order, exists := om.orders[orderID]
+	om.orderMu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("order not found: %s", orderID)
+	}
+
+	if order.Status != OrderStatusPending {
+		return fmt.Errorf("cannot cancel order in status: %s", order.Status)
+	}
+
+	// Cancel on exchange
+	if err := om.client.CancelOrder(order.ID); err != nil {
+		return fmt.Errorf("failed to cancel order: %w", err)
+	}
+
+	// Update local status
+	om.updateOrderStatus(orderID, OrderStatusCancelled)
+
+	if om.onOrderCancelled != nil {
+		om.onOrderCancelled(order)
+	}
+
+	return nil
+}
+
+// CancelAllOrders cancels all pending orders
+func (om *OrderManager) CancelAllOrders() error {
+	om.orderMu.RLock()
+	pendingOrderIDs := make([]string, 0, len(om.pendingOrders))
+	for orderID := range om.pendingOrders {
+		pendingOrderIDs = append(pendingOrderIDs, orderID)
+	}
+	om.orderMu.RUnlock()
+
+	var errors []error
+	for _, orderID := range pendingOrderIDs {
+		if err := om.CancelOrder(orderID); err != nil {
+			errors = append(errors, err)
+			om.logger.Warn("Failed to cancel order",
+				zap.String("order_id", orderID),
+				zap.Error(err))
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("failed to cancel %d orders", len(errors))
+	}
+
+	om.logger.Info("All pending orders cancelled", zap.Int("count", len(pendingOrderIDs)))
+	return nil
+}
+
+// CancelOrdersBySymbol cancels all orders for a specific symbol
+func (om *OrderManager) CancelOrdersBySymbol(symbol string) error {
+	om.orderMu.RLock()
+	symbolOrders := make([]*Order, len(om.ordersBySymbol[symbol]))
+	copy(symbolOrders, om.ordersBySymbol[symbol])
+	om.orderMu.RUnlock()
+
+	var errors []error
+	for _, order := range symbolOrders {
+		if order.Status == OrderStatusPending {
+			if err := om.CancelOrder(order.ClientOrderID); err != nil {
+				errors = append(errors, err)
+			}
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("failed to cancel %d orders for %s", len(errors), symbol)
+	}
+
+	return nil
+}
+
+// GetOrder retrieves an order by ID
+func (om *OrderManager) GetOrder(orderID string) (*Order, error) {
+	om.orderMu.RLock()
+	defer om.orderMu.RUnlock()
+
+	order, exists := om.orders[orderID]
+	if !exists {
+		return nil, fmt.Errorf("order not found: %s", orderID)
+	}
+
+	// Return a copy
+	orderCopy := *order
+	return &orderCopy, nil
+}
+
+// GetOrdersBySymbol retrieves all orders for a symbol
+func (om *OrderManager) GetOrdersBySymbol(symbol string) []*Order {
+	om.orderMu.RLock()
+	defer om.orderMu.RUnlock()
+
+	orders := make([]*Order, len(om.ordersBySymbol[symbol]))
+	for i, order := range om.ordersBySymbol[symbol] {
+		orderCopy := *order
+		orders[i] = &orderCopy
+	}
+
+	return orders
+}
+
+// GetPendingOrders retrieves all pending orders
+func (om *OrderManager) GetPendingOrders() []*Order {
+	om.orderMu.RLock()
+	defer om.orderMu.RUnlock()
+
+	orders := make([]*Order, 0, len(om.pendingOrders))
+	for _, order := range om.pendingOrders {
+		orderCopy := *order
+		orders = append(orders, &orderCopy)
+	}
+
+	return orders
+}
+
+// GetOrderStats returns order statistics
+func (om *OrderManager) GetOrderStats() map[string]interface{} {
+	om.orderMu.RLock()
+	defer om.orderMu.RUnlock()
+
+	return map[string]interface{}{
+		"total_orders":      om.totalOrders,
+		"pending_orders":    len(om.pendingOrders),
+		"filled_orders":     len(om.filledOrders),
+		"cancelled_orders":  len(om.cancelledOrders),
+		"filled_orders_24h": om.filledOrders24h,
+		"rejected_orders":   om.rejectedOrders,
+		"last_order_time":   om.lastOrderTime,
+	}
+}
+
+// Private Methods
+
+func (om *OrderManager) validateOrder(order *Order) error {
+	if order == nil {
+		return fmt.Errorf("order is nil")
+	}
+
+	if order.Symbol == "" {
+		return fmt.Errorf("symbol is required")
+	}
+
+	if order.Size == 0 || order.Size < 0 {
+		return fmt.Errorf("invalid order size: %s", fmt.Sprintf("%.2f", order.Size))
+	}
+
+	if order.Side != PositionLong && order.Side != PositionShort {
+		return fmt.Errorf("invalid side: %s", order.Side)
+	}
+
+	if order.Type == OrderTypeLimit && (order.Price == 0 || order.Price < 0) {
+		return fmt.Errorf("limit orders require valid price: %s", fmt.Sprintf("%.2f", order.Price))
+	}
+
+	// Check for duplicate client order ID
+	om.orderMu.RLock()
+	_, exists := om.orders[order.ClientOrderID]
+	om.orderMu.RUnlock()
+
+	if exists && order.ClientOrderID != "" {
+		return fmt.Errorf("duplicate client order ID: %s", order.ClientOrderID)
+	}
+
+	return nil
+}
+
+func (om *OrderManager) storeOrder(order *Order) {
+	om.orderMu.Lock()
+	defer om.orderMu.Unlock()
+
+	om.orders[order.ClientOrderID] = order
+	om.pendingOrders[order.ClientOrderID] = order
+
+	// Add to symbol index
+	om.ordersBySymbol[order.Symbol] = append(om.ordersBySymbol[order.Symbol], order)
+}
+
+func (om *OrderManager) removeOrder(orderID string) {
+	om.orderMu.Lock()
+	defer om.orderMu.Unlock()
+
+	order, exists := om.orders[orderID]
+	if !exists {
+		return
+	}
+
+	delete(om.orders, orderID)
+	delete(om.pendingOrders, orderID)
+
+	// Remove from symbol index
+	symbolOrders := om.ordersBySymbol[order.Symbol]
+	for i, o := range symbolOrders {
+		if o.ClientOrderID == orderID {
+			om.ordersBySymbol[order.Symbol] = append(symbolOrders[:i], symbolOrders[i+1:]...)
+			break
+		}
+	}
+}
+
+func (om *OrderManager) updateOrderStatus(orderID string, status OrderStatus) {
+	om.orderMu.Lock()
+	defer om.orderMu.Unlock()
+
+	order, exists := om.orders[orderID]
+	if !exists {
+		return
+	}
+
+	oldStatus := order.Status
+	order.Status = status
+	order.UpdatedAt = time.Now()
+
+	// Move between status maps
+	if oldStatus == OrderStatusPending {
+		delete(om.pendingOrders, orderID)
+	}
+
+	switch status {
+	case OrderStatusFilled:
+		om.filledOrders[orderID] = order
+		om.filledOrders24h++
+	case OrderStatusCancelled:
+		om.cancelledOrders[orderID] = order
+	case OrderStatusRejected:
+		om.rejectedOrders++
+	}
+}
+
+func (om *OrderManager) messageHandler(messages <-chan []byte, errors <-chan error) {
+	defer om.wg.Done()
+
+	for {
+		select {
+		case <-om.ctx.Done():
+			return
+
+		case err := <-errors:
+			om.logger.Error("WebSocket error", zap.Error(err))
+
+		case message := <-messages:
+			if err := om.handleWebSocketMessage(message); err != nil {
+				om.logger.Error("Failed to handle WebSocket message",
+					zap.Error(err),
+					zap.ByteString("message", message))
+			}
+		}
+	}
+}
+
+func (om *OrderManager) handleWebSocketMessage(message []byte) error {
+	var wsMsg map[string]interface{}
+	if err := json.Unmarshal(message, &wsMsg); err != nil {
+		return fmt.Errorf("failed to parse WebSocket message: %w", err)
+	}
+
+	channel, ok := wsMsg["channel"].(string)
+	if !ok {
+		return nil // Not a channel message
+	}
+
+	switch channel {
+	case "fills":
+		return om.handleFillMessage(wsMsg["data"])
+	case "user":
+		return om.handleUserMessage(wsMsg["data"])
+	case "trades":
+		return om.handleTradeMessage(wsMsg["data"])
+	}
+
+	return nil
+}
+
+func (om *OrderManager) handleFillMessage(data interface{}) error {
+	fills, ok := data.([]interface{})
+	if !ok {
+		return fmt.Errorf("invalid fills data format")
+	}
+
+	for _, fill := range fills {
+		fillData, ok := fill.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		fillEvent, err := om.parseFillEvent(fillData)
+		if err != nil {
+			om.logger.Warn("Failed to parse fill event", zap.Error(err))
+			continue
+		}
+
+		om.processFillEvent(fillEvent)
+	}
+
+	return nil
+}
+
+func (om *OrderManager) handleUserMessage(data interface{}) error {
+	userData, ok := data.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid user data format")
+	}
+
+	// Handle order updates
+	if orders, ok := userData["orders"].([]interface{}); ok {
+		for _, order := range orders {
+			orderData, ok := order.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			om.processOrderUpdate(orderData)
+		}
+	}
+
+	return nil
+}
+
+func (om *OrderManager) handleTradeMessage(data interface{}) error {
+	// Handle trade confirmations
+	trades, ok := data.([]interface{})
+	if !ok {
+		return fmt.Errorf("invalid trades data format")
+	}
+
+	for _, trade := range trades {
+		tradeData, ok := trade.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		om.processTradeUpdate(tradeData)
+	}
+
+	return nil
+}
+
+func (om *OrderManager) parseFillEvent(data map[string]interface{}) (*FillEvent, error) {
+	orderID, _ := data["oid"].(string)
+	if orderID == "" {
+		// Try to get from cloid (client order ID)
+		orderID, _ = data["cloid"].(string)
+	}
+
+	symbol, _ := data["coin"].(string)
+	sizeStr, _ := data["sz"].(string)
+	priceStr, _ := data["px"].(string)
+	feeStr, _ := data["fee"].(string)
+	tradeID, _ := data["tid"].(string)
+
+	size, err := decimal.NewFromString(sizeStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid size: %s", sizeStr)
+	}
+
+	price, err := decimal.NewFromString(priceStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid price: %s", priceStr)
+	}
+
+	fee := decimal.Zero
+	if feeStr != "" {
+		fee, _ = decimal.NewFromString(feeStr)
+	}
+
+	side := PositionLong
+	if dir, ok := data["dir"].(string); ok && dir == "Sell" {
+		side = PositionShort
+	}
+
+	return &FillEvent{
+		OrderID:   orderID,
+		Symbol:    symbol,
+		Side:      PositionSide(side),
+		Size:      size,
+		Price:     price,
+		Fee:       fee,
+		TradeID:   tradeID,
+		Timestamp: time.Now(),
+	}, nil
+}
+
+func (om *OrderManager) processFillEvent(fill *FillEvent) {
+	om.orderMu.Lock()
+	defer om.orderMu.Unlock()
+
+	// Find order by exchange ID or client ID
+	var order *Order
+	for _, o := range om.orders {
+		if o.ID == fill.OrderID || o.ClientOrderID == fill.OrderID {
+			order = o
+			break
+		}
+	}
+
+	if order == nil {
+		om.logger.Warn("Received fill for unknown order", zap.String("order_id", fill.OrderID))
+		return
+	}
+
+	// Update order with fill information
+	oldFilledSize := order.FilledSize
+	sizeF, _ := fill.Size.Float64()
+order.FilledSize = order.FilledSize + sizeF
+
+	// Calculate weighted average fill price
+if order.AvgFillPrice == 0 {
+	priceF, _ := fill.Price.Float64()
+	order.AvgFillPrice = priceF
+} else {
+	oldFilled := oldFilledSize // already float64
+	priceF, _ := fill.Price.Float64()
+	sizeF, _ := fill.Size.Float64()
+	totalValue := (order.AvgFillPrice * oldFilled) + (priceF * sizeF)
+	order.AvgFillPrice = totalValue / order.FilledSize
+}
+
+	
+
+	// Check if order is fully filled
+	if order.FilledSize >= order.Size {
+		order.Status = OrderStatusFilled
+		delete(om.pendingOrders, order.ClientOrderID)
+		om.filledOrders[order.ClientOrderID] = order
+		zap.String("filled_size", fmt.Sprintf("%.2f", order.FilledSize)),
+		zap.String("avg_price", fmt.Sprintf("%.2f", order.AvgFillPrice)))
+} else {
+	// Partial fill
+	if om.onOrderPartial != nil {
+		go om.onOrderPartial(order)
+	}
+
+	om.logger.Info("Order partially filled",
+		zap.String("order_id", order.ClientOrderID),
+		zap.String("symbol", order.Symbol),
+		zap.String("filled_size", fmt.Sprintf("%.2f", order.FilledSize)),
+		zap.String("remaining", fmt.Sprintf("%.2f", order.Size - order.FilledSize)))
+}
+
+func (om *OrderManager) processOrderUpdate(data map[string]interface{}) {
+	orderID, _ := data["oid"].(string)
+	if orderID == "" {
+		orderID, _ = data["cloid"].(string)
+	}
+
+	statusStr, _ := data["status"].(string)
+
+	var status OrderStatus
+	switch statusStr {
+	case "open":
+		status = OrderStatusPending
+	case "filled":
+		status = OrderStatusFilled
+	case "canceled":
+		status = OrderStatusCancelled
+	case "rejected":
+		status = OrderStatusRejected
+	default:
+		return // Unknown status
+	}
+
+	om.updateOrderStatus(orderID, status)
+}
+
+func (om *OrderManager) processTradeUpdate(data map[string]interface{}) {
+	// Process trade confirmations and updates
+	// Implementation depends on specific trade message format
+}
+
+func (om *OrderManager) orderMonitor() {
+	defer om.wg.Done()
+
+	ticker := time.NewTicker(OrderCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-om.ctx.Done():
+			return
+		case <-ticker.C:
+			om.checkTimeoutOrders()
+		}
+	}
+}
+
+func (om *OrderManager) checkTimeoutOrders() {
+	om.orderMu.RLock()
+	timeoutOrders := make([]*Order, 0)
+	now := time.Now()
+
+	for _, order := range om.pendingOrders {
+		if now.Sub(order.CreatedAt) > OrderTimeout {
+			timeoutOrders = append(timeoutOrders, order)
+		}
+	}
+	om.orderMu.RUnlock()
+
+	for _, order := range timeoutOrders {
+		om.logger.Warn("Order timeout detected",
+			zap.String("order_id", order.ClientOrderID),
+			zap.String("symbol", order.Symbol),
+			zap.Duration("age", now.Sub(order.CreatedAt)))
+
+		// Optionally cancel timeout orders
+		// om.CancelOrder(order.ClientOrderID)
+	}
+}
+
+func (om *OrderManager) staleOrderCleaner() {
+	defer om.wg.Done()
+
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-om.ctx.Done():
+			return
+		case <-ticker.C:
+			om.cleanStaleOrders()
+		}
+	}
+}
+
+func (om *OrderManager) cleanStaleOrders() {
+	om.orderMu.Lock()
+	defer om.orderMu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-MaxOrderAge)
+
+	// Clean filled orders older than MaxOrderAge
+	for orderID, order := range om.filledOrders {
+		if order.UpdatedAt.Before(cutoff) {
+			delete(om.filledOrders, orderID)
+			delete(om.orders, orderID)
+
+			// Remove from symbol index
+			symbolOrders := om.ordersBySymbol[order.Symbol]
+			for i, o := range symbolOrders {
+				if o.ClientOrderID == orderID {
+					om.ordersBySymbol[order.Symbol] = append(symbolOrders[:i], symbolOrders[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+
+	// Clean cancelled orders
+	for orderID, order := range om.cancelledOrders {
+		if order.UpdatedAt.Before(cutoff) {
+			delete(om.cancelledOrders, orderID)
+			delete(om.orders, orderID)
+		}
+	}
+}
+
+func (om *OrderManager) generateOrderID() string {
+	return fmt.Sprintf("bot_%d_%d", time.Now().UnixNano(), om.totalOrders)
+}
